@@ -18,14 +18,12 @@ SYSTEM_THREAD(ENABLED);
 // Function declaration
 void displayInfo();
 
-const unsigned long PUBLISH_PERIOD = 5 * 60 * 1000; // 5 minute delay
-const unsigned long MAX_GPS_AGE_MS = 10000;
+const unsigned long PUBLISH_PERIOD = 5 * 60 * 1000; // minutes * seconds * ms
+const unsigned long SLEEP_TIME_SECS = 2 * 60 * 60; // hours * minutes * seconds
 
 // TinyGPS++ object declaration
 TinyGPSPlus gps;
-unsigned long lastSerial = 0;
 unsigned long lastPublish = 0;
-bool gettingFix = false;
 
 // FuelGauge declaration for 'batt' function
 FuelGauge fuel;
@@ -37,27 +35,18 @@ IridiumSBD modem(IridiumSerial, D0);
 
 void setup()
 {
-    Particle.disconnect();
-
-    // Functions will allow you to instantly ping a location and also get battery updates
-    // Functions can be reached through the Particle console
-    // Alternatively, you can download the Particle CLI and call the function
-    // Calling the function uses the format $ particle call (deviceName) (functionName) ex. $ particle call ManateeTracker batt
-    Particle.function("batt", batteryStatus);
-    Particle.function("gps", gpsPublish);
-    Particle.function("test", iridiumTest);
-
     Serial.begin(9600);
 
     AssetTrackerSerial.begin(9600);
     IridiumSerial.begin(19200);
-    modem.begin();
+    modem.sleep();
 
     // Power up the GPS module
     // Setting D6 LOW begins the Asset Tracker (t.gpsOn)
     pinMode(D6, OUTPUT);
     digitalWrite(D6, LOW);
-    gettingFix = true;
+
+    Particle.function("gps", gpsPublish);
 }
 
 void loop()
@@ -71,19 +60,19 @@ void loop()
             displayInfo();
         }
     }
+
 }
 
 void displayInfo()
 {
-    // Make sure that the current time - the last time a coordinate was taken > the set delay (PUBLISH_PERIOD)
-    if (millis() - lastSerial >= PUBLISH_PERIOD) {
-        // Capture the current time when this GPS coordinate is being taken
-        lastSerial = millis();
-
+      // This if statement ensures that enough time has passed for the GPS to get a fix
+      if (millis() - lastPublish >= PUBLISH_PERIOD) {
+        // Store the time when we last published a coordinate
+        lastPublish = millis();
         // Declare a buffer in order to store the message (coordinate or failed attempt) that is to be sent
         char buf[128];
 
-        // Make sure that the location obtained by the GPS is valid and also new
+        // Make sure that the location obtained by the GPS is valid
         if (gps.location.isValid()) {
             // Print data to the buffer (latitude and longitude)
             snprintf(buf, sizeof(buf), "%f, %f", gps.location.lat(), gps.location.lng());
@@ -97,37 +86,45 @@ void displayInfo()
         // In this case, the event name is called G, we publish buf (which either contains our coordinates or 'no location'), and the event is private to us
         // Otherwise, we want to send the message through the Iridium Satellite system (rockBLOCK 9603)
         // Sending through the rockBLOCK may take a couple minutes
+        // If the Particle is connected, we also publish the battery info (voltage and state of charge)
         if (Particle.connected()) {
-            lastPublish = millis();
             Particle.publish("G", buf, PRIVATE);
-            modem.sendSBDText(buf);
+            Particle.publish("B", "v:" + String::format("%.2f", fuel.getVCell())
+                + ", c:" + String::format("%.2f", fuel.getSoC()),
+                60, PRIVATE);
         }
         else {
-          modem.sendSBDText(buf);
+            // Start the modem (which has been asleep this entire time to conserve battery)
+            modem.begin();
+
+            // Send the message
+            // Afterwards, we put the modem back to sleep to conserve battery
+            modem.sendSBDText(buf);
+            modem.sleep();
         }
-    }
+
+        // The delay here ensures that by publishing, we don't accidentally ping cellular
+        // This would immediately wake up our Electron after putting it into stop mode
+
+        delay(10000);
+
+        // This cellular command allows us to wake the Electron through cellular
+
+        Cellular.command("AT+URING=1\r\n");
+        delay(1000);
+
+        // Set the Electron to stop mode but still listening
+        // Only drains about 4.5 mA in this stop mode
+
+        System.sleep(RI_UC, RISING, SLEEP_TIME_SECS, SLEEP_NETWORK_STANDBY);
+        Cellular.command("AT+URING=0\r\n");
+      }
 }
 
-// This function allows you to ping the Electron in order to determine its battery status
-// In the Events tab, the output is displayed under event name B and displays the battery voltage as well as the % of charge remaining
-// The function returns 1 in the CLI if the battery percentage exceeds 10%
-// The function returns 0 otherwise
-int batteryStatus(String command)
-{
-  Particle.publish("B", "v:" + String::format("%.2f", fuel.getVCell())
-      + ", c:" + String::format("%.2f", fuel.getSoC()),
-      60, PRIVATE);
-
-  if (fuel.getSoC() > 10) {
-    return 1;
-  }
-  else {
-    return 0;
-  }
-}
-
-// This function mimics displayInfo() pretty closely and allows you to ping the Electron for its current location
-// However, this function does not reset the timer of lastSerial, thus the program continues to run as normal
+// Function to ping the Manatee Tracker
+// This will restart the 2 hour sleep timer, meaning that after you ping the device, another coordinate will be published in 5 minutes
+// Then the device will go to sleep again for 2 hours
+// Behaves very similarly to displayInfo()
 // The function returns 0 if no location/GPS fix is obtained
 // The function returns 1 if the GPS coordinate was transmitted to the Particle cloud
 // The function returns 2 if the GPS coordinate was transmitted to the Iridium satellite network
@@ -137,7 +134,7 @@ int gpsPublish(String command)
         gps.encode(AssetTrackerSerial.read());
 
     char buf[128];
-    if (gps.location.isValid() && gps.location.age() < MAX_GPS_AGE_MS) {
+    if (gps.location.isValid()) {
         snprintf(buf, sizeof(buf), "%f, %f, %f", gps.location.lat(), gps.location.lng());
     }
     else {
@@ -155,20 +152,4 @@ int gpsPublish(String command)
         modem.sendSBDText(buf);
         return 2;
     }
-}
-
-int iridiumTest(String command)
-{
-  int err = modem.sendSBDText("Hello, world!");
-
-  if(err != ISBD_SUCCESS) {
-    Particle.publish("error", "sendSBDText failed: error", PRIVATE);
-    if (err == ISBD_SENDRECEIVE_TIMEOUT)
-      Particle.publish("error", "Try again with a better view of the sky.", PRIVATE);
-  }
-  else {
-    Particle.publish("error", "Hey, it worked!", PRIVATE);
-  }
-
-  return 0;
 }
